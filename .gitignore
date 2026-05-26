@@ -1,0 +1,92 @@
+<<<<<<< HEAD
+# Node modules
+node_modules/
+*/node_modules/
+**/node_modules/
+
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Dependency directories
+jspm_packages/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Misc
+*.tgz
+*.zip
+
+# Coverage
+coverage/
+
+# Large installer files
+*.exe
+*.msi
+*.dmg
+*.pkg
+
+# Installer build artifacts
+installer-*.bmp
+=======
+# Node modules
+node_modules/
+*/node_modules/
+**/node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Dependency directories
+jspm_packages/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Misc
+*.tgz
+*.zip
+
+# Coverage
+coverage/
+
+# Large installer files
+*.exe
+*.msi
+*.dmg
+*.pkg
+
+# Installer build artifacts
+installer-*.bmp
+installer-*.png
+
+# Debug files
+*debug*.js
+*test*.js

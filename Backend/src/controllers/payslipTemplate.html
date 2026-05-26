@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Payslip</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      color: #222;
+    }
+
+    .container {
+      width: 210mm;
+      height: 148mm;
+      margin: 0 auto;
+      background: #fff;
+      padding: 2px;
+      box-sizing: border-box;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+    }
+
+    .header-title {
+      font-size: 22px;
+      font-weight: bold;
+    }
+
+    .header-address {
+      font-size: 13px;
+      margin-top: 2px;
+    }
+
+    .header-right img {
+      height: 48px;
+    }
+
+    .section-title {
+      color: #0074c1;
+      font-size: 16px;
+      font-weight: bold;
+      border-bottom: 2px solid #0074c1;
+      margin-top: 6px;
+      margin-bottom: 4px;
+      padding-bottom: 1px;
+    }
+
+    .details-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 6px;
+    }
+
+    .details-table td {
+      padding: 1px;
+      font-size: 12px;
+    }
+
+    .details-table .label {
+      font-weight: bold;
+      background: #f6f6f6;
+      width: 200px;
+    }
+
+    .details-table .value {
+      background: #f6f6f6;
+      width: 200px;
+    }
+
+    .salary-section {
+      margin-top: 10px;
+    }
+
+    .salary-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 0;
+    }
+
+    .salary-table th,
+    .salary-table td {
+      border: 1px solid #000000;
+      padding: 3px 4px;
+      font-size: 12px;
+    }
+
+    .salary-table th {
+      background: #eaf4fb;
+      color: #0074c1;
+      font-weight: bold;
+    }
+
+    .salary-table .total-row {
+      background: #f6f6f6;
+      font-weight: bold;
+    }
+
+    .salary-table .net-row {
+      background: #e6f7e6;
+      font-weight: bold;
+      color: #000;
+    }
+
+    .deductions-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 0;
+    }
+
+    .deductions-table th,
+    .deductions-table td {
+      border: 1px solid #b5d4ef;
+      padding: 6px 8px;
+      font-size: 13px;
+    }
+
+    .deductions-table th {
+      background: #eaf4fb;
+      color: #0074c1;
+      font-weight: bold;
+    }
+
+    .deductions-table .total-row {
+      background: #f6f6f6;
+      font-weight: bold;
+    }
+
+    .payment-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 16px;
+    }
+
+    .payment-table td {
+      padding: 4px 8px;
+      font-size: 13px;
+    }
+
+    .payment-table .label {
+      font-weight: bold;
+      background: #f6f6f6;
+      width: 180px;
+    }
+
+    .payment-table .value {
+      background: #f6f6f6;
+    }
+
+    .footer {
+      text-align: center;
+      color: #888;
+      font-size: 9px;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container" style="height:595px; width:842px;">
+    <div class="header">
+      <div class="header-left">
+        <div class="header-title">Atithi Paper LLP</div>
+        <div class="header-address">National Highway 27, Opp. bahadurgadh Village, Morbi - 363670</div>
+      </div>
+      <div class="header-right">
+        <img src="{{logoDataUri}}" alt="Logo" />
+      </div>
+    </div>
+    <div class="section-title">Pay slip for the month of {{monthYear}}</div>
+    <table class="details-table">
+      <tr>
+        <td class="label">Employee ID</td>
+        <td class="value">{{empId}}</td>
+        <td class="label">Joining Date</td>
+        <td class="value">{{joiningDate}}</td>
+        <td class="label">PAN No.</td>
+        <td class="value">{{pan}}</td>
+        <td class="label">Present Days</td>
+        <td class="value">{{presentDays}}</td>
+      </tr>
+      <tr>
+        <td class="label">Employee Name</td>
+        <td class="value">{{name}}</td>
+        <td class="label">Date of Birth</td>
+        <td class="value">{{dob}}</td>
+        <td class="label">UAN</td>
+        <td class="value">{{uan}}</td>
+        <td class="label">Absent Days</td>
+        <td class="value">{{absentDays}}</td>
+      </tr>
+      <tr>
+        <td class="label">Designation</td>
+        <td class="value">{{designation}}</td>
+        <td class="label">Total Days</td>
+        <td class="value">{{totalDays}}</td>
+        <td class="label">PF Acct No.</td>
+        <td class="value">{{pfAccount}}</td>
+        <td class="label">PH Paid Days</td>
+        <td class="value">{{paidPhDays}}</td>
+      </tr>
+      <tr>
+        <td class="label">Department</td>
+        <td class="value">{{department}}</td>
+        <td class="label">Paid Days</td>
+        <td class="value">{{paidDays}}</td>
+        <td class="label">ESI No.</td>
+        <td class="value">{{esi}}</td>
+        <td class="label">OT Hours</td>
+        <td class="value">{{otHours}}</td>
+      </tr>
+    </table>
+    <div class="section-title" style="margin-top: 18px;">Salary Details</div>
+    <table class="salary-table">
+      <tr>
+        <th colspan="6">Earnings(₹)</th>
+        <th colspan="2">Deductions(₹)</th>
+      </tr>
+      <tr>
+        <th>Fixed</th>
+        <th>Earned</th>
+        <th>OT Earned</th>
+        <th>PH Earned</th>
+        <th>Adjustments</th>
+        <th>Total</th>
+        <th>Particulars</th>
+        <th>Amount</th>
+      </tr>
+      {{#salaryRows}}
+      <tr>
+        <td>{{earningFixed}}</td>
+        <td>{{earningEarned}}</td>
+        <td>{{otEarned}}</td>
+        <td>{{phEarned}}</td>
+        <td>{{adjustments}}</td>
+        <td>{{earningTotal}}</td>
+        <td>{{deductionName}}</td>
+        <td>{{deductionAmount}}</td>
+      </tr>
+      {{/salaryRows}}
+      <tr class="total-row">
+        <td colspan="5" style="text-align:right;">Total Earnings</td>
+        <td>{{totalEarnings}}</td>
+        <td style="text-align:right;">Total Deductions</td>
+        <td>{{totalDeduction}}</td>
+      </tr>
+      <tr class="net-row">
+        <td colspan="8">Net Payable ₹{{netPayable}} &nbsp;&nbsp; [INR {{netPayableWords}}]</td>
+      </tr>
+    </table>
+    <div class="section-title" style="margin-top: 18px;">Payment Details</div>
+    <table class="payment-table">
+      <tr>
+        <td class="label">Payment Mode:</td>
+        <td class="value">{{paymentMode}}</td>
+        <td class="label">Bank Name:</td>
+        <td class="value">{{bankName}}</td>
+      </tr>
+      <tr>
+        <td class="label">Account Number:</td>
+        <td class="value">{{accountNo}}</td>
+        <td class="label">IFSC Code:</td>
+        <td class="value">{{ifsc}}</td>
+      </tr>
+    </table>
+    <div class="footer">This is a computer generated payslip hence does not require any signature.</div>
+    <div style="text-align: center; margin-top: 20px;">
+      <button onclick="downloadPayslip()"
+        style="background-color: #8B0000; color: #FFF9E3; border: none; padding: 10px 20px; font-size: 16px; cursor: pointer; border-radius: 4px; font-weight: bold;">Download
+        PDF</button>
+    </div>
+    <script>
+      function downloadPayslip() {
+        // Use the employee ID and month from template data
+        const empId = '{{empId}}';
+        const month = '{{monthYear}}'; // This is in format MM-YYYY
+
+        // Convert MM-YYYY to YYYY-MM format
+        const [monthPart, yearPart] = month.split('-');
+        const formattedMonth = `${yearPart}-${monthPart}`;
+
+        if (empId && formattedMonth) {
+          // Redirect to the download endpoint
+          window.location.href = `/api/v1/hr/payroll/payslip/${empId}?month=${formattedMonth}`;
+        } else {
+          alert('Unable to download payslip. Missing employee ID or month.');
+        }
+      }
+    </script>
+  </div>
+</body>
+
+</html>

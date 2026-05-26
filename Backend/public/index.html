@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Atithi WorkFlow Pro</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .status {
+            text-align: center;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .endpoint {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-family: monospace;
+            border: 1px solid #dee2e6;
+        }
+        .button {
+            display: inline-block;
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            margin: 10px 5px;
+        }
+        .button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Atithi WorkFlow Pro</h1>
+        
+        <div class="status success">
+            <h2>✅ Application Deployed Successfully</h2>
+            <p>Your Atithi WorkFlow Pro application is running!</p>
+        </div>
+        
+        <div class="status info">
+            <h3>API Endpoints</h3>
+            <p>Backend API is available at: <span class="endpoint">/api/v1/</span></p>
+            <p>Example endpoints:</p>
+            <div class="endpoint">/api/v1/users/login</div>
+            <div class="endpoint">/api/v1/employees</div>
+            <div class="endpoint">/api/v1/punch</div>
+        </div>
+        
+        <div style="text-align: center; margin-top: 30px;">
+            <a href="/api/v1/users/login" class="button">Test API Login</a>
+            <a href="/api/docs" class="button">API Documentation</a>
+        </div>
+        
+        <div style="margin-top: 30px; text-align: center; color: #666; font-size: 0.9em;">
+            <p>Frontend will be served from this same domain once built.</p>
+            <p>For development, access the frontend at <a href="http://localhost:3000">http://localhost:3000</a></p>
+        </div>
+    </div>
+</body>
+</html>

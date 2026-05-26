@@ -1,0 +1,1605 @@
+// payroll/hr.payroll.controller.js
+import { User } from '../../models/user.model.js';
+import { AttendanceSession } from '../../models/attendanceSession.model.js';
+import { PaidHoliday } from '../../models/paidHoliday.model.js';
+import mongoose from 'mongoose';
+import { validateDatabaseConnection, } from '../../utils/productionExportFixes.js';
+import { getMonthlyPayrollSummaryCore, calculatePayroll, getPayrollForEmployee } from '../../services/payroll.service.js';
+import { fetchPayrollDataSafely } from '../../utils/productionExportFixes.js';
+import generatePayslipPdf from '../generatePayslipPdf.js';
+import { imageFileToDataUri, numberToWords } from '../generatePayslipPdf.js';
+import fs from 'fs/promises';
+import fsSync from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Parse month query [Need for getFastPayroll]
+function parseYearMonthFromQuery(query) {
+  if (query?.month) {
+    const m = String(query.month).match(/(\d{4})-(\d{1,2})/);
+    if (m) return { year: Number(m[1]), month: Number(m[2]) };
+  }
+  if (query?.year && query?.monthNum) {
+    const y = String(query.year).match(/(\d{4})/);
+    const mm = String(query.monthNum).match(/(\d{1,2})/);
+    if (y && mm) return { year: Number(y[1]), month: Number(mm[1]) };
+  }
+  // fallback: try year & month numeric
+  if (query?.year && query?.month) {
+    const y = String(query.year).match(/(\d{4})/);
+    const mm = String(query.month).match(/(\d{1,2})/);
+    if (y && mm) return { year: Number(y[1]), month: Number(mm[1]) };
+  }
+  return null;
+}
+
+// Fast payroll endpoint for frontend
+export const getFastPayroll = async (req, res) => {
+  const start = Date.now();
+  try {
+    // parse same as before...
+    const parsed = parseYearMonthFromQuery(req.query);
+    if (!parsed) {
+      return res.status(400).json({ success: false, message: 'Invalid month', records: [], total: 0 });
+    }
+    const { year, month } = parsed;
+
+    // call core (make sure it returns an array of records or an object with records key)
+    const data = await getMonthlyPayrollSummaryCore({ year, month });
+
+    // Normalize data into consistent shape:
+    // - records: array of per-employee payroll rows
+    // - summary: totals & meta
+    let records = [];
+    let summary = {};
+
+    if (Array.isArray(data)) {
+      records = data;
+    } else if (data && Array.isArray(data.records)) {
+      records = data.records;
+      summary = data.summary || {};
+    } else if (data && typeof data === 'object') {
+      // Attempt to extract common shapes
+      records = data.payrollRecords || data.records || data.rows || [];
+      summary = data.summary || { totalRecords: records.length };
+    }
+
+    const elapsedMs = Date.now() - start;
+    return res.status(200).json({
+      success: true,
+      message: records.length ? 'Payroll calculated successfully' : 'No payroll records found',
+      month: `${year}-${String(month).padStart(2, '0')}`,
+      generatedAt: new Date().toISOString(),
+      processingTimeMs: elapsedMs,
+      total: records.length,
+      records,
+      summary
+    });
+  } catch (err) {
+    console.error('Fast payroll error:', err?.message || String(err));
+    return res.status(500).json({ success: false, error: 'An error occurred while calculating payroll', records: [], total: 0 });
+  }
+};
+
+/**
+ * Helper: safe date formatting (DD-MM-YYYY)
+ */
+function formatDateSafe(d) {
+  try {
+    if (!d) return '';
+    const dt = new Date(d);
+    if (Number.isNaN(dt.getTime())) return '';
+    return `${String(dt.getDate()).padStart(2, '0')}-${String(dt.getMonth() + 1).padStart(2, '0')}-${dt.getFullYear()}`;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Build salary rows for payslip from payroll data
+ * @param {Object} payrollRow - Payroll data for an employee
+ * @returns {Array} - Array of salary row objects for the payslip template
+ */
+function buildSalaryRowsFromPayroll(payrollRow) {
+  const rows = [];
+
+  // Calculate earned amount (gross salary minus OT and adjustments)
+  const grossSalary = payrollRow?.grossSalary ?? 0;
+  const otSalary = payrollRow?.otSalary ?? 0;
+  const febAdjustment = payrollRow?.febAdjustment ?? 0;
+  const earned = grossSalary - otSalary - febAdjustment;
+
+  // Map earnings rows (you can expand based on your payroll shape)
+  rows.push({
+    earningFixed: payrollRow?.fixedSalary ?? 0,
+    earningEarned: earned,
+    otEarned: payrollRow?.otSalary ?? 0,
+    phEarned: payrollRow?.phPaid ?? 0,
+    adjustments: payrollRow?.febAdjustment ?? 0,
+    earningTotal: payrollRow?.grossSalary ?? 0,
+    deductionName: (payrollRow?.deductions && payrollRow.deductions[0]) ? payrollRow.deductions[0].name : '',
+    deductionAmount: (payrollRow?.deductions && payrollRow.deductions[0]) ? payrollRow.deductions[0].amount : 0
+  });
+
+  // If there are multiple deductions, push them as separate rows (empty earnings columns)
+  if (Array.isArray(payrollRow?.deductions)) {
+    for (let i = 1; i < payrollRow.deductions.length; i++) {
+      const d = payrollRow.deductions[i];
+      rows.push({
+        earningFixed: '',
+        earningEarned: '',
+        otEarned: '',
+        phEarned: '',
+        adjustments: '',
+        earningTotal: '',
+        deductionName: d.name || '',
+        deductionAmount: d.amount || 0
+      });
+    }
+  }
+
+  return rows;
+}
+
+/**
+ * Controller: downloadPayslip
+ * Route: GET /hr/payroll/payslip/:empId?month=YYYY-MM
+ */
+export const downloadPayslip = async (req, res) => {
+  const { empId } = req.params;
+  const monthParam = req.query.month; // expect YYYY-MM
+
+  if (!empId) return res.status(400).json({ error: 'empId is required' });
+  if (!monthParam || !/^\d{4}-\d{1,2}$/.test(String(monthParam))) {
+    return res.status(400).json({ error: 'month is required (YYYY-MM)' });
+  }
+
+  // parse year/month
+  const [yearNum, monthNum] = String(monthParam).split('-').map(n => Number(n));
+  if (!yearNum || !monthNum || monthNum < 1 || monthNum > 12) {
+    return res.status(400).json({ error: 'Invalid month format. Use YYYY-MM' });
+  }
+
+  try {
+    // 1) Fetch employee record
+    const user = await User.findOne({ empId }); // adapt query if your field name differs
+    if (!user) return res.status(404).json({ error: 'Employee not found' });
+
+    // 2) Compute payroll for this employee & month (adapt calculatePayroll signature if needed)
+    // Prefer a function that returns a payroll object for one employee — if your calculatePayroll returns all employees, filter it
+    let payrollRow;
+    try {
+      payrollRow = await getPayrollForEmployee(empId, `${yearNum}-${String(monthNum).padStart(2, '0')}`);
+    } catch (calcErr) {
+      console.warn('Payroll calc failed for empId, falling back to zeros:', calcErr?.message || calcErr);
+      payrollRow = null;
+    }
+
+    // 3) Build data object for generatePayslipPdf
+    const data = {
+      empId,
+      name: user.name || user.fullName || `${user.firstName || ''} ${user.lastName || ''}`.trim(),
+      pan: user.pan || '',
+      monthYear: `${String(monthNum).padStart(2, '0')}-${yearNum}`,
+      joiningDate: formatDateSafe(user.joiningDate || user.joinDate || user.createdAt),
+      dob: formatDateSafe(user.dob || user.dateOfBirth),
+      uan: user.uanNo || user.uan || '', // Fixed: uan field might be stored as uanNo
+      esi: user.esi || '',
+      pfAccount: user.pfAccount || user.pfNumber || '',
+      designation: user.designation || user.jobTitle || user.position || '', // Added fallback to position
+      department: user.department || '',
+      totalDays: new Date(yearNum, monthNum, 0).getDate(),
+      paidDays: payrollRow?.paidDays ?? '',
+      presentDays: payrollRow?.presentDays ?? '',
+      absentDays: payrollRow?.absentDays ?? '',
+      paidPhDays: payrollRow?.paidPhDays ?? '',
+      otHours: payrollRow?.otHours ?? payrollRow?.overtimeHours ?? 0,
+      totalEarnings: payrollRow?.totalEarnings ?? payrollRow?.grossSalary ?? 0,
+      totalDeductions: payrollRow?.totalDeductions ?? payrollRow?.totalDeduction ?? 0,
+      netPayable: payrollRow?.netSalary ?? payrollRow?.net ?? payrollRow?.netPayable ?? 0,
+      netPayableWords: '', // optional: convert number to words if you have a util
+      paymentMode: user.paymentMode || 'Bank Transfer',
+      // Fixed: Access bank details from the nested bankDetails object
+      bankName: user.bankDetails?.nameOnBank || user.bankDetails?.bankName || user.bankName || '',
+      accountNo: user.bankDetails?.accountNo || user.accountNo || user.bankAccount || '',
+      ifsc: user.bankDetails?.ifsc || user.ifsc || user.ifscCode || '',
+      // salaryRows is an array that your fillTemplate handles
+      salaryRows: payrollRow ? buildSalaryRowsFromPayroll(payrollRow) : []
+    };
+
+    // Optionally set explicit logoPath (if you want to force it)
+    const possibleLogo = path.join(process.cwd(), 'public', 'frontend', 'atithi-logo.png');
+    console.log('Checking for logo at:', possibleLogo);
+    console.log('Logo exists:', fsSync.existsSync(possibleLogo));
+    if (fsSync.existsSync(possibleLogo)) {
+      data.logoPath = possibleLogo;
+      console.log('Logo path set to:', data.logoPath);
+    }
+
+    // 4) Generate PDF into a temp path (unique)
+    const tmpDir = path.join(process.cwd(), 'tmp', 'payslips');
+    if (!fsSync.existsSync(tmpDir)) fsSync.mkdirSync(tmpDir, { recursive: true });
+
+    const filename = `payslip_${empId}_${yearNum}-${String(monthNum).padStart(2, '0')}.pdf`;
+    const outputPdfPath = path.join(tmpDir, filename);
+
+    // Defensive check: ensure output path is string
+    if (typeof outputPdfPath !== 'string') {
+      console.error('Invalid output path', outputPdfPath);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+
+    // 5) Generate PDF (your function handles template fill + image dataUri)
+    const resultPath = await generatePayslipPdf(data, outputPdfPath);
+    if (!resultPath || typeof resultPath !== 'string') {
+      console.error('generatePayslipPdf returned invalid result:', resultPath);
+      return res.status(500).json({ error: 'Failed to generate payslip PDF' });
+    }
+
+    // 6) Send file with proper headers
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    // Stream the file (res.download also works)
+    return res.download(resultPath, filename, async (err) => {
+      if (err) {
+        console.error('Error while sending PDF:', err);
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to download payslip' });
+      }
+
+      // Cleanup temp
+      try {
+        if (fsSync.existsSync(resultPath)) {
+          await fs.unlink(resultPath);
+        }
+      } catch (cleanupErr) {
+        console.warn('Failed to cleanup temp PDF:', cleanupErr);
+      }
+    });
+  } catch (err) {
+    console.error('downloadPayslip error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Controller: previewPayslip
+ * Route: GET /hr/payroll/preview/:empId?month=YYYY-MM
+ * Returns HTML preview of payslip without generating PDF
+ */
+export const previewPayslip = async (req, res) => {
+  const { empId } = req.params;
+  const monthParam = req.query.month; // expect YYYY-MM
+
+  if (!empId) return res.status(400).json({ error: 'empId is required' });
+  if (!monthParam || !/^\d{4}-\d{1,2}$/.test(String(monthParam))) {
+    return res.status(400).json({ error: 'month is required (YYYY-MM)' });
+  }
+
+  // parse year/month
+  const [yearNum, monthNum] = String(monthParam).split('-').map(n => Number(n));
+  if (!yearNum || !monthNum || monthNum < 1 || monthNum > 12) {
+    return res.status(400).json({ error: 'Invalid month format. Use YYYY-MM' });
+  }
+
+  try {
+    // 1) Fetch employee record
+    const user = await User.findOne({ empId }); // adapt query if your field name differs
+    if (!user) return res.status(404).json({ error: 'Employee not found' });
+
+    // 2) Compute payroll for this employee & month (adapt calculatePayroll signature if needed)
+    // Prefer a function that returns a payroll object for one employee — if your calculatePayroll returns all employees, filter it
+    let payrollRow;
+    try {
+      payrollRow = await getPayrollForEmployee(empId, `${yearNum}-${String(monthNum).padStart(2, '0')}`);
+    } catch (calcErr) {
+      console.warn('Payroll calc failed for empId, falling back to zeros:', calcErr?.message || calcErr);
+      payrollRow = null;
+    }
+
+    // 3) Build data object for generatePayslipPdf
+    const data = {
+      empId,
+      name: user.name || user.fullName || `${user.firstName || ''} ${user.lastName || ''}`.trim(),
+      pan: user.pan || '',
+      monthYear: `${String(monthNum).padStart(2, '0')}-${yearNum}`,
+      joiningDate: formatDateSafe(user.joiningDate || user.joinDate || user.createdAt),
+      dob: formatDateSafe(user.dob || user.dateOfBirth),
+      uan: user.uanNo || user.uan || '', // Fixed: uan field might be stored as uanNo
+      esi: user.esi || '',
+      pfAccount: user.pfAccount || user.pfNumber || '',
+      designation: user.designation || user.jobTitle || user.position || '', // Added fallback to position
+      department: user.department || '',
+      totalDays: new Date(yearNum, monthNum, 0).getDate(),
+      paidDays: payrollRow?.paidDays ?? '',
+      presentDays: payrollRow?.presentDays ?? '',
+      absentDays: payrollRow?.absentDays ?? '',
+      paidPhDays: payrollRow?.paidPhDays ?? '',
+      otHours: payrollRow?.otHours ?? payrollRow?.overtimeHours ?? 0,
+      totalEarnings: payrollRow?.totalEarnings ?? payrollRow?.grossSalary ?? 0,
+      totalDeductions: payrollRow?.totalDeductions ?? payrollRow?.totalDeduction ?? 0,
+      netPayable: payrollRow?.netSalary ?? payrollRow?.net ?? payrollRow?.netPayable ?? 0,
+      netPayableWords: '', // optional: convert number to words if you have a util
+      paymentMode: user.paymentMode || 'Bank Transfer',
+      // Fixed: Access bank details from the nested bankDetails object
+      bankName: user.bankDetails?.nameOnBank || user.bankDetails?.bankName || user.bankName || '',
+      accountNo: user.bankDetails?.accountNo || user.accountNo || user.bankAccount || '',
+      ifsc: user.bankDetails?.ifsc || user.ifsc || user.ifscCode || '',
+      // salaryRows is an array that your fillTemplate handles
+      salaryRows: payrollRow ? buildSalaryRowsFromPayroll(payrollRow) : []
+    };
+
+    // Optionally set explicit logoPath (if you want to force it)
+    const possibleLogo = path.join(process.cwd(), '..', 'frontend', 'public', 'atithi-logo.png');
+    if (fsSync.existsSync(possibleLogo)) {
+      data.logoPath = possibleLogo;
+    }
+
+    // Generate the HTML preview
+    try {
+      // Get template path
+      const templatePath = path.join(__dirname, '../payslipTemplate.html');
+
+      if (!fsSync.existsSync(templatePath)) {
+        throw new Error(`Template file not found at: ${templatePath}`);
+      }
+
+      // Read template
+      let template = fsSync.readFileSync(templatePath, 'utf8');
+
+      // Convert logo file to data URI if present, else empty string.
+      let logoDataUri = '';
+      if (data.logoPath) {
+        logoDataUri = await imageFileToDataUri(data.logoPath);
+      }
+      data.logoDataUri = logoDataUri;
+
+      // Add netPayableWords if not already present
+      if (data.netPayable && !data.netPayableWords) {
+        data.netPayableWords = numberToWords(Math.floor(data.netPayable));
+      }
+
+      // Fill template with data
+      const html = fillTemplate(template, data);
+
+      // Send HTML response
+      res.setHeader('Content-Type', 'text/html');
+      return res.status(200).send(html);
+    } catch (previewErr) {
+      console.error('Payslip preview error:', previewErr);
+      return res.status(500).json({ error: 'Failed to generate payslip preview' });
+    }
+  } catch (err) {
+    console.error('previewPayslip error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// Helper function to fill template with data
+function fillTemplate(template, data) {
+  let html = template;
+
+  // Handle salaryRows first (special Mustache-like block)
+  if (Array.isArray(data.salaryRows)) {
+    let rowsHtml = '';
+    data.salaryRows.forEach(row => {
+      // Build a row using the same columns you expect
+      // Be sure to safely coerce values to strings
+      const safe = (val) => {
+        try {
+          if (val === null || val === undefined) return '';
+          if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') return String(val);
+          if (Array.isArray(val)) return val.join(', ');
+          // For objects, try JSON.stringify but guard against circular
+          try { return JSON.stringify(val); } catch { return ''; }
+        } catch { return ''; }
+      };
+
+      rowsHtml += `<tr>
+        <td>${safe(row.earningFixed)}</td>
+        <td>${safe(row.earningEarned)}</td>
+        <td>${safe(row.otEarned)}</td>
+        <td>${safe(row.phEarned)}</td>
+        <td>${safe(row.adjustments)}</td>
+        <td>${safe(row.earningTotal)}</td>
+        <td>${safe(row.deductionName)}</td>
+        <td>${safe(row.deductionAmount)}</td>
+      </tr>\n`;
+    });
+
+    // Replace the whole block between {{#salaryRows}} and {{/salaryRows}}
+    html = html.replace(/{{#salaryRows}}[\s\S]*?{{\/salaryRows}}/, rowsHtml);
+  }
+
+  // Now replace primitive placeholders only (skip arrays/objects)
+  const keys = Object.keys(data || {});
+  for (const key of keys) {
+    if (key === 'salaryRows') continue; // already handled
+
+    const value = data[key];
+    // Only replace for primitive values
+    if (value === null || value === undefined) {
+      html = html.replace(new RegExp(`{{${key}}}`, 'g'), '');
+      continue;
+    }
+
+    const t = typeof value;
+    if (t === 'string' || t === 'number' || t === 'boolean') {
+      // Use a safe string coercion
+      const safe = String(value);
+      html = html.replace(new RegExp(`{{${key}}}`, 'g'), safe);
+    }
+  }
+
+  return html;
+}
+
+// numberToWords function is imported from generatePayslipPdf.js and now includes paise handling
+
+// Export bank sheet
+export const exportBankSheet = async (req, res) => {
+  const timeout = withTimeout(res, 60000);
+
+  try {
+    const { month } = req.query;
+    if (!month) {
+      clearTimeout(timeout);
+      return res.status(400).json({ error: "Month is required (YYYY-MM)" });
+    }
+
+    // Validate database connection
+    if (!(await validateDatabaseConnection(mongoose))) {
+      throw new Error('Database connection failed');
+    }
+
+    // Import professional Excel export utilities
+    const {
+      createProfessionalWorkbook,
+      addProfessionalHeader,
+      styleHeaderRow,
+      applyProfessionalStyling,
+      styleTotalsRow,
+      autoAdjustColumnWidths,
+      formatCurrency,
+      createProfessionalFilename
+    } = await import('../../utils/professionalExcelExport.js');
+
+    // Import safe Excel export utility
+    const { safeExcelExport, safeDataProcessor, fetchPayrollDataSafely, fetchUserDataSafely, safeValue } = await import('../../utils/productionExportFixes.js');
+
+    // Create workbook generator function
+    const generateWorkbook = async () => {
+      // Get payroll data with retries
+      const payroll = await fetchPayrollDataSafely(
+        (params) => payrollServiceGetMonthlyPayrollSummary({ query: params }, { status: () => ({ json: (x) => x }) }),
+        { month }
+      );
+
+      // Get user details safely
+      const empIds = payroll.map(e => e.empId);
+      const users = await fetchUserDataSafely(User, empIds);
+
+      // Create user map
+      const userMap = {};
+      users.forEach(u => { userMap[u.empId] = u; });
+
+      // Format month as 'June 2024'
+      const [year, monthNum] = month.split('-');
+      const monthNames = [
+        'January', 'February', 'March', 'April', 'May', 'June',
+        'July', 'August', 'September', 'October', 'November', 'December'
+      ];
+      const formattedMonth = `${monthNames[parseInt(monthNum, 10) - 1]} ${year}`;
+      const reportTitle = `Bank Transfer Sheet - ${formattedMonth}`;
+
+      // Create professional workbook
+      const workbook = createProfessionalWorkbook(reportTitle);
+      const sheet = workbook.addWorksheet("Bank Sheet");
+
+      // Add professional header
+      addProfessionalHeader(sheet, reportTitle, new Date(), 6);
+
+      // Add header row (row 5 since we have 4 header rows)
+      const headerRowIndex = 5;
+      const headerRow = sheet.getRow(headerRowIndex);
+      headerRow.values = ["Emp Code", "Emp Name", "AC No", "IFSC", "Mobile No", "Amount"];
+      styleHeaderRow(headerRow);
+
+      // Process data safely
+      const processedData = safeDataProcessor(payroll, (emp) => {
+        const user = userMap[emp.empId];
+        return [
+          safeValue(emp.empId),
+          safeValue(emp.name),
+          safeValue(user?.bankDetails?.accountNo),
+          safeValue(user?.bankDetails?.ifsc),
+          safeValue(user?.mobile || user?.bankDetails?.mobileNo),
+          parseFloat(emp.netSalary) || 0
+        ];
+      });
+
+
+      // Add data rows
+      let total = 0;
+      processedData.forEach(rowData => {
+        sheet.addRow(rowData);
+        total += rowData[5] || 0;
+      });
+
+      // Add totals row
+      const totalRow = sheet.addRow(["", "", "", "", "Total", total]);
+
+      // Format currency in total row
+      const amountCell = totalRow.getCell(6);
+      amountCell.value = formatCurrency(total);
+
+      // Apply styling
+      applyProfessionalStyling(sheet, headerRowIndex, headerRowIndex + 1);
+      styleTotalsRow(totalRow);
+
+      // Format currency values in data rows
+      for (let i = headerRowIndex + 1; i <= sheet.rowCount - 1; i++) {
+        const row = sheet.getRow(i);
+        const cell = row.getCell(6);
+        if (typeof cell.value === 'number') {
+          cell.value = formatCurrency(cell.value);
+        }
+      }
+
+      // Auto-adjust column widths
+      autoAdjustColumnWidths(sheet);
+
+      return workbook;
+    };
+
+    // Create professional filename
+    const [year, monthNum] = month.split('-');
+    const exportDate = new Date(year, monthNum - 1);
+    const filename = createProfessionalFilename("Bank_Transfer", exportDate);
+
+    // Export with safe handling
+    await safeExcelExport(res, generateWorkbook, filename);
+    clearTimeout(timeout);
+
+  } catch (err) {
+    clearTimeout(timeout);
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: "Bank sheet export failed",
+        message: err.message,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+};
+
+// Export salary sheet
+export const exportSalarySheet = async (req, res) => {
+  try {
+    const { month } = req.query;
+    if (!month) return res.status(400).json({ error: "Month is required (YYYY-MM)" });
+
+    // Import professional Excel export utilities
+    const {
+      createProfessionalWorkbook,
+      addProfessionalHeader,
+      styleHeaderRow,
+      applyProfessionalStyling,
+      styleTotalsRow,
+      autoAdjustColumnWidths,
+      formatCurrency,
+      createProfessionalFilename
+    } = await import('../../utils/professionalExcelExport.js');
+
+    // Get payroll data
+    const payrollRes = await getMonthlyPayrollSummary({ query: { month } }, { status: () => ({ json: (x) => x }) });
+    const payroll = payrollRes.data || [];
+    // Get user details for all employees
+    const empIds = payroll.map(e => e.empId);
+    const users = await User.find({ empId: { $in: empIds }, role: { $ne: 'ADMIN' } });
+    const userMap = {};
+    users.forEach(u => { userMap[u.empId] = u; });
+    // Format month as 'June 2024'
+    const [year, monthNum] = month.split('-');
+    const monthNames = [
+      'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December'
+    ];
+    const formattedMonth = `${monthNames[parseInt(monthNum, 10) - 1]} ${year}`;
+    const reportTitle = `Salary Sheet - ${formattedMonth}`;
+
+    // Create professional workbook
+    const workbook = createProfessionalWorkbook(reportTitle);
+    const sheet = workbook.addWorksheet("Salary Sheet");
+
+    // Column headers
+    const columns = [
+      { header: "Sr No", key: "srNo", width: 6 },
+      { header: "Emp Code", key: "empId", width: 12 },
+      { header: "Emp Name", key: "name", width: 25 },
+      { header: "Department", key: "department", width: 18 },
+      { header: "Designation", key: "designation", width: 18 },
+      { header: "Fixed Salary", key: "fixedSalary", width: 14 },
+      { header: "Present Days", key: "presentDays", width: 12 },
+      { header: "Absent Days", key: "absentDays", width: 12 },
+      { header: "Paid PH", key: "phPaid", width: 10 },
+      { header: "SL", key: "slUsed", width: 6 },
+      { header: "CL", key: "clUsed", width: 6 },
+      { header: "PL", key: "plUsed", width: 6 },
+      { header: "C/OFF", key: "cOffUsed", width: 8 },
+      { header: "Net Present Days", key: "paidDays", width: 16 },
+      { header: "OT Hours", key: "otHours", width: 10 },
+      { header: "OT Amount", key: "otSalary", width: 12 },
+      { header: "Gross Salary", key: "grossSalary", width: 14 },
+      { header: "Prof Tax/TDS", key: "profTax", width: 12 },
+      { header: "WF Fund", key: "wfFund", width: 10 },
+      { header: "Adv/Loan", key: "advLoan", width: 10 },
+      { header: "Canteen", key: "canteen", width: 10 },
+      { header: "Room Rent", key: "roomRent", width: 10 },
+      { header: "PF", key: "pf", width: 10 },
+      { header: "ESI", key: "esi", width: 10 },
+      { header: "LOP", key: "lop", width: 10 },
+      { header: "Other", key: "other", width: 10 },
+      { header: "Total Deduction", key: "totalDeduction", width: 14 },
+      { header: "Net Salary", key: "netSalary", width: 14 },
+    ];
+    sheet.columns = columns;
+
+    // Add professional header
+    addProfessionalHeader(sheet, reportTitle, new Date(), columns.length);
+
+    // Add column headers (row 5 since we have 4 header rows)
+    const headerRowIndex = 5;
+    sheet.getRow(headerRowIndex).values = columns.map(c => c.header);
+    styleHeaderRow(sheet.getRow(headerRowIndex));
+
+    // Add data rows
+    let totals = {};
+    columns.forEach(col => { totals[col.key] = 0; });
+
+    if (Array.isArray(payroll)) {
+      payroll.forEach((emp, idx) => {
+        const user = users.find(u => u.empId === emp.empId);
+        const deductions = {};
+        if (emp.deductions && Array.isArray(emp.deductions)) {
+          emp.deductions.forEach(d => {
+            const key = d.name?.toLowerCase().replace(/\s+/g, '') || 'other';
+            deductions[key] = d.amount || 0;
+          });
+        }
+        const row = {
+          srNo: idx + 1,
+          empId: emp.empId,
+          name: emp.name,
+          department: emp.department,
+          designation: emp.position,
+          fixedSalary: emp.fixedSalary,
+          presentDays: emp.presentDays,
+          absentDays: emp.absentDays !== undefined && emp.absentDays !== null ? emp.absentDays : 0,
+          phPaid: emp.phPaid,
+          slUsed: emp.leaveBreakdown?.SL || 0,
+          clUsed: emp.leaveBreakdown?.CL || 0,
+          plUsed: emp.leaveBreakdown?.PL || 0,
+          cOffUsed: emp.leaveBreakdown?.COFF || 0,
+          paidDays: emp.paidDays,
+          otHours: emp.otHours || 0,
+          otSalary: emp.otSalary || 0,
+          grossSalary: emp.grossSalary,
+          profTax: deductions['proftax/tds'] || deductions['tds'] || deductions['proftax'] || 0,
+          wfFund: deductions['wffund'] || 0,
+          advLoan: deductions['adv/loan'] || deductions['loan'] || deductions['advance'] || 0,
+          canteen: deductions['canteen'] || 0,
+          roomRent: deductions['roomrent'] || 0,
+          pf: deductions['pf'] || 0,
+          esi: deductions['esi'] || 0,
+          lop: deductions['lop'] || 0,
+          other: deductions['other'] || 0,
+          totalDeduction: emp.totalDeduction,
+          netSalary: emp.netSalary,
+        };
+        ["fixedSalary", "presentDays", "absentDays", "phPaid", "slUsed", "clUsed", "plUsed", "cOffUsed", "paidDays", "otHours", "otSalary", "grossSalary", "profTax", "wfFund", "advLoan", "canteen", "roomRent", "pf", "esi", "lop", "other", "totalDeduction", "netSalary"].forEach(k => {
+          totals[k] += parseFloat(row[k]) || 0;
+        });
+        sheet.addRow(row);
+      });
+    }
+
+    // Add totals row
+    const totalRowData = {};
+    columns.forEach(col => {
+      if (["srNo", "empId", "name", "department", "designation"].includes(col.key)) {
+        totalRowData[col.key] = "Total";
+      } else {
+        totalRowData[col.key] = totals[col.key];
+      }
+    });
+    const totalRow = sheet.addRow(totalRowData);
+
+    // Apply professional styling
+    applyProfessionalStyling(sheet, headerRowIndex, headerRowIndex + 1);
+
+    // Style totals row
+    styleTotalsRow(totalRow);
+
+    // Format currency values in data rows
+    for (let i = headerRowIndex + 1; i <= sheet.rowCount - 1; i++) {
+      const row = sheet.getRow(i);
+      ["fixedSalary", "otSalary", "grossSalary", "profTax", "wfFund", "advLoan", "canteen", "roomRent", "pf", "esi", "lop", "other", "totalDeduction", "netSalary"].forEach(key => {
+        const cell = row.getCell(key);
+        if (typeof cell.value === 'number') {
+          cell.value = formatCurrency(cell.value);
+        }
+      });
+    }
+
+    // Format currency values in totals row
+    ["fixedSalary", "otSalary", "grossSalary", "profTax", "wfFund", "advLoan", "canteen", "roomRent", "pf", "esi", "lop", "other", "totalDeduction", "netSalary"].forEach(key => {
+      const cell = totalRow.getCell(key);
+      if (typeof cell.value === 'number') {
+        cell.value = formatCurrency(cell.value);
+      }
+    });
+
+    // Auto-adjust column widths
+    autoAdjustColumnWidths(sheet);
+
+    // Create professional filename
+    const exportDate = new Date(year, monthNum - 1);
+    const filename = createProfessionalFilename("Salary", exportDate);
+
+    // Set response headers
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error("Salary sheet export error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+};
+
+// Export attendance sheet
+export const exportAttendanceSheet = async (req, res) => {
+  try {
+    console.log('[exportAttendanceSheet] Starting function');
+    const { month } = req.query;
+    console.log('[exportAttendanceSheet] Received params:', { month });
+    if (!month) {
+      console.log('[exportAttendanceSheet] Missing month parameter');
+      return res.status(400).json({ error: "Month is required (YYYY-MM)" });
+    }
+
+    // Parse the month parameter (YYYY-MM format)
+    const [year, monthNum] = month.split("-").map(Number);
+    if (!year || !monthNum || monthNum < 1 || monthNum > 12) {
+      console.log('[exportAttendanceSheet] Invalid month format');
+      return res.status(400).json({ error: "Invalid month format. Expected YYYY-MM" });
+    }
+
+    const daysInMonth = new Date(year, monthNum, 0).getDate();
+    console.log('[exportAttendanceSheet] Parsed date:', { monthNum, year, daysInMonth });
+
+    const startDate = new Date(year, monthNum - 1, 1);
+    const endDate = new Date(year, monthNum, 0, 23, 59, 59, 999);
+    console.log('[exportAttendanceSheet] Date range:', { startDate, endDate });
+
+    // Get all employees
+    console.log('[exportAttendanceSheet] Fetching employees');
+    const users = await User.find({ role: { $ne: 'ADMIN' } }).lean();
+    const employeeIds = users.map(u => u.empId);
+    console.log('[exportAttendanceSheet] Found employees:', employeeIds.length);
+
+    // Get payroll data using the correct function signature
+    console.log('[exportAttendanceSheet] Fetching payroll data');
+    const payroll = await fetchPayrollDataSafely(
+      (params) => payrollServiceGetMonthlyPayrollSummary({ query: params }, { status: () => ({ json: (x) => x }) }),
+      { month }
+    );
+    console.log('[exportAttendanceSheet] Found payroll records:', payroll?.length || 0);
+
+    // Get PH dates
+    const phDates = [];
+    const paidHolidays = await PaidHoliday.find({
+      date: { $gte: startDate, $lte: endDate }
+    });
+    paidHolidays.forEach(ph => {
+      phDates.push(ph.date.toISOString().slice(0, 10));
+    });
+    console.log('[exportAttendanceSheet] PH dates:', phDates);
+
+    // Get attendance data
+    console.log('[exportAttendanceSheet] Fetching attendance data');
+    // Create a mock request object with the month parameter for getMonthlyAttendanceSummary
+    const mockReq = { query: { month: `${year}-${String(monthNum).padStart(2, '0')}`, phDates } };
+    const attendanceResponse = await getMonthlyAttendanceSummary(mockReq, {}, true); // Pass true to indicate internal call
+    const attendance = Array.isArray(attendanceResponse) ? attendanceResponse : (attendanceResponse?.data || []);
+    console.log('[exportAttendanceSheet] Found attendance records:', attendance.length);
+
+    // Get all sessions for attendance calculation
+    // Include sessions that started in this month or previous month but ended in this month (for night shifts)
+    console.log('[exportAttendanceSheet] Fetching attendance sessions');
+    const allSessions = await AttendanceSession.find({
+      employeeId: { $in: employeeIds },
+      $or: [
+        { inTime: { $gte: startDate, $lte: endDate } }, // Sessions that started in our range
+        {
+          inTime: { $lt: startDate }, // Sessions that started before our range
+          outTime: { $gte: startDate, $lte: endDate } // But ended in our range (night shifts from previous day)
+        }
+      ]
+    }).lean();
+
+    console.log(`[exportAttendanceSheet] Found ${allSessions.length} sessions for ${employeeIds.length} employees`);
+
+    console.log('[exportAttendanceSheet] Importing professional Excel export utilities');
+    const {
+      createProfessionalWorkbook,
+      addProfessionalHeader,
+      styleHeaderRow,
+      applyProfessionalStyling,
+      styleTotalsRow,
+      autoAdjustColumnWidths,
+      createProfessionalFilename
+    } = await import('../../utils/professionalExcelExport.js');
+    console.log('[exportAttendanceSheet] Successfully imported Excel utilities');
+
+    console.log('[exportAttendanceSheet] Creating professional workbook');
+    const monthNames = [
+      'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December'
+    ];
+    const formattedMonth = `${monthNames[monthNum - 1]} ${year}`;
+    const reportTitle = `Attendance Sheet - ${formattedMonth}`;
+    const workbook = createProfessionalWorkbook(reportTitle);
+    const sheet = workbook.addWorksheet("Attendance Sheet");
+    console.log('[exportAttendanceSheet] Workbook and sheet created successfully');
+
+    const staticCols = [
+      { header: "Sr No", key: "srNo", width: 6 },
+      { header: "Emp Code", key: "empId", width: 12 },
+      { header: "Emp Name", key: "name", width: 25 },
+      { header: "Department", key: "department", width: 18 },
+      { header: "Designation", key: "designation", width: 18 },
+      { header: "Fixed Salary", key: "fixedSalary", width: 14 },
+    ];
+    const dayCols = Array.from({ length: daysInMonth }, (_, i) => ({
+      header: (i + 1).toString(),
+      key: `d${i + 1}`,
+      width: 12, // Increased width to accommodate time format
+    }));
+    const summaryCols = [
+      { header: "Total Present", key: "totalPresent", width: 12 },
+      { header: "Absent", key: "absent", width: 8 },
+      { header: "PH", key: "phPaid", width: 6 },
+      { header: "SL", key: "slUsed", width: 6 },
+      { header: "CL", key: "clUsed", width: 6 },
+      { header: "PL", key: "plUsed", width: 6 },
+      { header: "C/OFF", key: "cOffUsed", width: 8 },
+      { header: "Net Present Days", key: "paidDays", width: 16 },
+      { header: "OT Hours", key: "otHours", width: 10 }, // Add OT Hours column
+      { header: "Gross Salary", key: "grossSalary", width: 14 },
+    ];
+    const columns = [...staticCols, ...dayCols, ...summaryCols];
+    sheet.columns = columns;
+
+    // Add professional header
+    addProfessionalHeader(sheet, reportTitle, new Date(), columns.length);
+
+    // Add column headers (row 5 since we have 4 header rows)
+    const headerRowIndex = 5;
+    sheet.getRow(headerRowIndex).values = columns.map(c => c.header);
+    styleHeaderRow(sheet.getRow(headerRowIndex));
+
+    // --- Modern/professional Excel UI improvements ---
+    const attendanceMap = {};
+    if (Array.isArray(attendance)) {
+      attendance.forEach(emp => { attendanceMap[emp.empId] = emp; });
+    }
+    let totals = {};
+    columns.forEach(col => { totals[col.key] = 0; });
+
+    // Create a map to track which dates should be blank for night shifts
+    const nightShiftBlankDates = {};
+    const inDateSessions = {}; // Track sessions by their IN date
+
+    // First pass: collect all sessions by IN date
+    allSessions.forEach(session => {
+      if (session.inTime) {
+        const inDateStr = new Date(session.inTime).toISOString().slice(0, 10);
+        if (!inDateSessions[session.employeeId]) {
+          inDateSessions[session.employeeId] = {};
+        }
+        inDateSessions[session.employeeId][inDateStr] = session;
+      }
+    });
+
+    // Second pass: identify night shifts and mark OUT dates that should be blank
+    allSessions.forEach(session => {
+      if (session.inTime && session.outTime) {
+        const inTime = new Date(session.inTime);
+        const outTime = new Date(session.outTime);
+
+        // Check if IN and OUT are on different dates
+        const inDateStr = inTime.toISOString().slice(0, 10);
+        const outDateStr = outTime.toISOString().slice(0, 10);
+
+        // Calculate session duration in hours
+        const sessionDuration = (outTime - inTime) / (1000 * 60 * 60);
+
+        // If this is a night shift with duration < 24 hours
+        if (inDateStr !== outDateStr && sessionDuration < 24) {
+          // Check if the OUT date is also an IN date for another session
+          // If so, we don't mark it as blank because the IN session takes priority
+          const hasInSessionOnOutDate = inDateSessions[session.employeeId] &&
+            inDateSessions[session.employeeId][outDateStr];
+
+          // Only mark as blank if there's no IN session on that date
+          if (!hasInSessionOnOutDate) {
+            // Mark the OUT date to be blank
+            if (!nightShiftBlankDates[session.employeeId]) {
+              nightShiftBlankDates[session.employeeId] = [];
+            }
+            nightShiftBlankDates[session.employeeId].push(outDateStr);
+            console.log(`[exportAttendanceSheet] Marking date ${outDateStr} as absent for employee ${session.employeeId} due to night shift`);
+          }
+        }
+      }
+    });
+
+    // Process each employee
+    users.forEach((user, idx) => {
+      const empId = user.empId;
+      const empAttendance = attendanceMap[empId] || {};
+      const empSessions = allSessions.filter(session => session.employeeId === empId);
+      const empPayroll = payroll.find(p => p.empId === empId) || {};
+      const empName = `${user.firstName} ${user.lastName}`;
+      const empDepartment = user.department || 'N/A';
+      const empDesignation = user.position || 'N/A';
+      const empFixedSalary = user.monthlySalary || 0;
+
+      // Create row data
+      const row = {
+        srNo: idx + 1,
+        empId,
+        name: empName,
+        department: empDepartment,
+        designation: empDesignation,
+        fixedSalary: empFixedSalary,
+      };
+
+      // Add daily attendance data
+      for (let d = 1; d <= daysInMonth; d++) {
+        const dateObj = new Date(year, monthNum - 1, d);
+        const dateStr = dateObj.toISOString().slice(0, 10);
+
+        // Check if this date should be blank due to night shift logic
+        if (nightShiftBlankDates[empId] && nightShiftBlankDates[empId].includes(dateStr)) {
+          row[`d${d}`] = 'A';
+        } else {
+          // Check for attendance data first (this includes session-based calculations)
+          if (empAttendance.daily && empAttendance.daily[d]) {
+            // Use the attendance code from the session-based calculation
+            const attendanceCode = empAttendance.daily[d].code;
+
+            // If it's a present day, show 'P' instead of timing values
+            if (attendanceCode === 'P') {
+              row[`d${d}`] = 'P';
+            } else {
+              // For other codes (PH, WO, etc.), use the code directly
+              row[`d${d}`] = attendanceCode;
+            }
+          } else {
+            // Fallback logic for cases where attendance data is not available
+            // PH
+            if (phDates.includes(dateStr)) row[`d${d}`] = 'PH';
+            // Weekly Off - Only for weeklyOff and weeklyOffWithCoff employee types
+            // Full month employees work on all days including Sundays
+            const isWeeklyOffEmployee = user && (user.employeeType === 'weeklyOff' || user.employeeType === 'weeklyOffWithCoff');
+            const empWeeklyOff = user && user.shiftDetails && user.shiftDetails.weeklyOff;
+            if (isWeeklyOffEmployee && empWeeklyOff && dateObj.toLocaleString('en-US', { weekday: 'long' }) === empWeeklyOff) row[`d${d}`] = 'WO';
+            // Default to 'A' for absent days
+            if (!row[`d${d}`]) row[`d${d}`] = 'A';
+          }
+        }
+      }
+
+      // Add summary data from payroll
+      row.totalPresent = empPayroll.presentDays || 0;
+      row.absent = (empPayroll.absentDays !== undefined && empPayroll.absentDays !== null) ? empPayroll.absentDays : 0;
+      row.phPaid = empPayroll.phPaid || 0;
+      row.slUsed = empPayroll.leaveBreakdown?.SL || 0;
+      row.clUsed = empPayroll.leaveBreakdown?.CL || 0;
+      row.plUsed = empPayroll.leaveBreakdown?.PL || 0;
+      row.cOffUsed = empPayroll.leaveBreakdown?.COFF || 0;
+      row.paidDays = empPayroll.paidDays || 0;
+      row.otHours = empPayroll.otHours || 0;
+      row.grossSalary = empPayroll.grossSalary || 0;
+
+      // Update totals
+      ["fixedSalary", "totalPresent", "absent", "phPaid", "slUsed", "clUsed", "plUsed", "cOffUsed", "paidDays", "otHours", "grossSalary"].forEach(k => {
+        totals[k] += parseFloat(row[k]) || 0;
+      });
+
+      // Add row to sheet
+      sheet.addRow(row);
+    });
+
+    // Add totals row
+    const totalRowData = {};
+    columns.forEach(col => {
+      if (["srNo", "empId", "name", "department", "designation"].includes(col.key) || col.key.startsWith("d")) {
+        totalRowData[col.key] = "";
+      } else {
+        totalRowData[col.key] = totals[col.key];
+      }
+    });
+    console.log('[exportAttendanceSheet] Adding total row');
+    const totalRow = sheet.addRow(totalRowData);
+
+    // Apply professional styling
+    console.log('[exportAttendanceSheet] Applying professional styling');
+    applyProfessionalStyling(sheet, headerRowIndex, headerRowIndex + 1);
+
+    // Style totals row
+    console.log('[exportAttendanceSheet] Styling totals row');
+    styleTotalsRow(totalRow);
+
+    // Auto-adjust column widths
+    console.log('[exportAttendanceSheet] Adjusting column widths');
+    autoAdjustColumnWidths(sheet);
+
+    // Create professional filename
+    const exportDate = new Date(year, monthNum - 1);
+    const filename = createProfessionalFilename("Attendance", exportDate);
+
+    console.log('[exportAttendanceSheet] Setting response headers');
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+    console.log('[exportAttendanceSheet] Writing Excel to response');
+    await workbook.xlsx.write(res);
+    console.log('[exportAttendanceSheet] Ending response');
+    res.end();
+  } catch (err) {
+    console.error('[exportAttendanceSheet] Error:', err);
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+};
+
+// Export salary summary by category as Excel
+export const exportSalarySummaryExcel = async (req, res) => {
+  try {
+    const { month } = req.query;
+    if (!month) return res.status(400).json({ error: "Month is required (YYYY-MM)" });
+    // Parse month and year
+    const [year, monthNum] = month.split("-").map(Number);
+    if (!year || !monthNum) {
+      return res.status(400).json({ error: "Invalid month format. Use YYYY-MM" });
+    }
+
+    // Import professional Excel export utilities
+    const {
+      createProfessionalWorkbook,
+      addProfessionalHeader,
+      styleHeaderRow,
+      applyProfessionalStyling,
+      styleTotalsRow,
+      autoAdjustColumnWidths,
+      formatCurrency,
+      createProfessionalFilename
+    } = await import('../../utils/professionalExcelExport.js');
+
+    // Get payroll data
+    const payrollRes = await getMonthlyPayrollSummary({ query: { month: `${year}-${monthNum.toString().padStart(2, '0')}` } }, { status: () => ({ json: (x) => x }) });
+    const payroll = payrollRes.data || [];
+    const empIds = payroll.map(e => e.empId);
+    const users = await User.find({ empId: { $in: empIds }, role: { $ne: 'ADMIN' } });
+    const userMap = {};
+    users.forEach(u => { userMap[u.empId] = u; });
+    function sumNet(category, filterOT = false) {
+      return payroll.filter(emp => {
+        const user = userMap[emp.empId];
+        if (!user) return false;
+        if (category === 'STAFFS(OFFICE)') return user.employeeCategory === 'STAFFS(OFFICE)';
+        if (category === 'STAFFS(PLANT)') return user.employeeCategory === 'STAFFS(PLANT)';
+        if (category === 'WORKERS (PLANT)') return user.employeeCategory === 'WORKERS (PLANT)';
+        return false;
+      }).reduce((sum, emp) => {
+        if (filterOT) return sum + (emp.otSalary || 0);
+        // Base net salary: netSalary minus otSalary
+        return sum + ((emp.netSalary || 0) - (emp.otSalary || 0));
+      }, 0);
+    }
+    // --- UPPER TABLE (Manual Entry Template) ---
+    const monthNames = [
+      'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December'
+    ];
+    const formattedMonth = `${monthNames[monthNum - 1]} ${year}`;
+    const upperTitle = `MONTHLY SALARY PROVISIONAL SUMMARY FOR THE MONTH OF ${formattedMonth.toUpperCase()}`;
+    const upperHeaders = ["SL NO", "PARTICULARS", "MAN POWER", "ACCOUNTS HEAD", "NET PAYABLE AMOUNT", "GST AMOUNT", "CANTEEN"];
+    const upperRows = Array.from({ length: 13 }, (_, i) => Array(7).fill(''));
+    // --- LOWER TABLE (Auto-filled Salary Summary) ---
+    const lowerTitle = upperTitle;
+    const lowerHeaders = ["SL NO", "PARTICULARS", "MAN POWER", "ACCOUNTS HEAD", "NET PAYABLE AMOUNT", "CANTEEN"];
+    const rows = [
+      { sl: 1, particulars: 'STAFFS(OFFICE)', manPower: '', accountsHead: 'MONTHLY SALARY', netPay: sumNet('STAFFS(OFFICE)'), canteen: '' },
+      { sl: 2, particulars: 'STAFFS(OFFICE)', manPower: '', accountsHead: 'MONTHLY OT', netPay: sumNet('STAFFS(OFFICE)', true), canteen: '' },
+      { sl: 3, particulars: 'STAFFS(PLANT)', manPower: '', accountsHead: 'MONTHLY SALARY', netPay: sumNet('STAFFS(PLANT)'), canteen: '' },
+      { sl: 4, particulars: 'STAFFS(PLANT)', manPower: '', accountsHead: 'MONTHLY OT', netPay: sumNet('STAFFS(PLANT)', true), canteen: '' },
+      { sl: 5, particulars: 'WORKERS (PLANT )', manPower: '', accountsHead: 'MONTHLY SALARY', netPay: sumNet('WORKERS (PLANT)'), canteen: '' },
+      { sl: 6, particulars: 'WORKERS (PLANT)', manPower: '', accountsHead: 'MONTHLY SHORT/EXTRA DUTY', netPay: 0, canteen: '' },
+      { sl: 7, particulars: 'DEFERANCE SALARY MAR (SALARY +OT)', manPower: '', accountsHead: 'MONTHLY SALARY', netPay: '', canteen: '' },
+      { sl: 8, particulars: 'PARTNERS SALARY', manPower: '', accountsHead: 'MONTHLY SALARY', netPay: '', canteen: '' },
+      { sl: 9, particulars: 'SECURITY (1) NIGHT PAGUBAPA, COLONY SUPERVISOR (1)PRAVEEN KAKA', manPower: '', accountsHead: 'MONTHLY SALARY', netPay: '', canteen: '' },
+      { sl: 10, particulars: 'OFFICE AND PLANT SWEEPER LADIES', manPower: '', accountsHead: 'MONTHLY SALARY', netPay: '', canteen: '' },
+    ];
+    const totalSalary = rows.reduce((sum, row) => sum + (typeof row.netPay === 'number' ? row.netPay : 0), 0);
+
+    // --- CREATE WORKBOOK ---
+    const reportTitle = `Salary Summary - ${formattedMonth}`;
+    const workbook = createProfessionalWorkbook(reportTitle);
+    const sheet = workbook.addWorksheet("Salary Summary");
+
+    // --- UPPER TABLE ---
+    addProfessionalHeader(sheet, reportTitle, new Date(), 7);
+
+    // Add upper table title (row 5 since we have 4 header rows)
+    const upperTableStartRow = 5;
+    sheet.mergeCells(`A${upperTableStartRow}:G${upperTableStartRow}`);
+    const upperTitleCell = sheet.getCell(`A${upperTableStartRow}`);
+    upperTitleCell.value = upperTitle;
+    upperTitleCell.alignment = { vertical: "middle", horizontal: "center" };
+    upperTitleCell.font = { bold: true, size: 12, color: { argb: 'FF1a7f37' } };
+
+    // Add upper table headers (row 6)
+    const upperHeaderRow = sheet.getRow(upperTableStartRow + 1);
+    upperHeaderRow.values = upperHeaders;
+    styleHeaderRow(upperHeaderRow);
+
+    // Data rows (empty for manual entry)
+    upperRows.forEach((row, i) => {
+      const r = sheet.addRow(row);
+      r.eachCell(cell => {
+        cell.alignment = { vertical: "middle", horizontal: "center" };
+        cell.border = { top: { style: "thin" }, left: { style: "thin" }, bottom: { style: "thin" }, right: { style: "thin" } };
+      });
+    });
+
+    // Total row for upper table
+    const upperTotalRow = sheet.addRow(['', '', '', '', 0, '', '']);
+    const upperTotalAmountCell = upperTotalRow.getCell(5);
+    upperTotalAmountCell.value = formatCurrency(0);
+    upperTotalAmountCell.font = { bold: true };
+    upperTotalAmountCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } };
+    upperTotalAmountCell.alignment = { vertical: "middle", horizontal: "center" };
+    upperTotalRow.getCell(6).font = { bold: true };
+    upperTotalRow.getCell(6).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } };
+    upperTotalRow.getCell(6).alignment = { vertical: "middle", horizontal: "center" };
+    upperTotalRow.getCell(7).font = { bold: true };
+    upperTotalRow.getCell(7).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } };
+    upperTotalRow.getCell(7).alignment = { vertical: "middle", horizontal: "center" };
+
+    // --- BLANK ROW ---
+    sheet.addRow([]);
+
+    // --- LOWER TABLE ---
+    const lowerStart = sheet.lastRow.number + 1;
+    sheet.mergeCells(`A${lowerStart}:F${lowerStart}`);
+    const lowerTitleCell = sheet.getCell(`A${lowerStart}`);
+    lowerTitleCell.value = lowerTitle;
+    lowerTitleCell.alignment = { vertical: "middle", horizontal: "center" };
+    lowerTitleCell.font = { bold: true, size: 12, color: { argb: 'FF1a7f37' } };
+
+    // Add lower table headers (row after title)
+    const lowerHeaderRow = sheet.getRow(lowerStart + 1);
+    lowerHeaderRow.values = lowerHeaders;
+    styleHeaderRow(lowerHeaderRow);
+
+    rows.forEach((row, i) => {
+      const r = sheet.addRow([
+        row.sl,
+        row.particulars,
+        row.manPower,
+        row.accountsHead,
+        typeof row.netPay === 'number' ? row.netPay : row.netPay,
+        row.canteen
+      ]);
+      r.eachCell(cell => {
+        cell.alignment = { vertical: "middle", horizontal: "center" };
+        cell.border = { top: { style: "thin" }, left: { style: "thin" }, bottom: { style: "thin" }, right: { style: "thin" } };
+      });
+    });
+
+    // Format currency values in lower table
+    for (let i = lowerStart + 2; i <= sheet.lastRow.number; i++) {
+      const row = sheet.getRow(i);
+      const amountCell = row.getCell(5);
+      if (typeof amountCell.value === 'number') {
+        amountCell.value = formatCurrency(amountCell.value);
+      }
+    }
+
+    // Total row for lower table
+    const lowerTotalRow = sheet.addRow(['', '', '', 'Total salary', totalSalary, '₹ 0.00']);
+    const lowerTotalAmountCell = lowerTotalRow.getCell(5);
+    lowerTotalAmountCell.value = formatCurrency(totalSalary);
+    lowerTotalRow.getCell(4).font = { bold: true };
+    lowerTotalRow.getCell(4).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } };
+    lowerTotalAmountCell.font = { bold: true };
+    lowerTotalAmountCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } };
+    lowerTotalRow.getCell(6).font = { bold: true };
+    lowerTotalRow.getCell(6).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } };
+
+    // Apply professional styling to both tables
+    applyProfessionalStyling(sheet, upperTableStartRow + 1, upperTableStartRow + 2);
+    applyProfessionalStyling(sheet, lowerStart + 1, lowerStart + 2);
+
+    // Style totals rows
+    styleTotalsRow(upperTotalRow);
+    styleTotalsRow(lowerTotalRow);
+
+    // --- COLUMN WIDTHS ---
+    [8, 45, 15, 25, 20, 20, 18].forEach((w, i) => sheet.getColumn(i + 1).width = w);
+
+    // --- RESPONSE ---
+    const exportDate = new Date(year, monthNum - 1);
+    const filename = createProfessionalFilename("Salary_Summary", exportDate);
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error("Salary summary export error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+};
+
+export const exportDailyAttendancePDF = async (req, res) => {
+  res.status(501).json({ error: "Not implemented" });
+};
+
+export const exportMonthlyAttendancePDF = async (req, res) => {
+  res.status(501).json({ error: "Not implemented" });
+};
+
+export const exportPayrollFilteredPDF = async (req, res) => {
+  res.status(501).json({ error: "Not implemented" });
+};
+
+export const getPerformanceAnalytics = async (req, res) => {
+  res.status(501).json({ error: "Not implemented" });
+};
+
+export const testDatabase = async (req, res) => {
+  res.status(501).json({ error: "Not implemented" });
+};
+
+export const simpleTest = async (req, res) => {
+  res.status(501).json({ error: "Not implemented" });
+};
+
+export const directPayrollTest = async (req, res) => {
+  res.status(501).json({ error: "Not implemented" });
+};
+
+// Get monthly attendance summary (moved from hr.controller.js)
+export const getMonthlyAttendanceSummary = async (req, res, isInternalCall = false) => {
+  try {
+    console.log('[getMonthlyAttendanceSummary] Starting function, isInternalCall:', isInternalCall);
+    const { month, phDates = [] } = req.query; // phDates: array of YYYY-MM-DD
+    console.log('[getMonthlyAttendanceSummary] Received params:', { month, phDates });
+    if (!month) {
+      console.log('[getMonthlyAttendanceSummary] Missing month parameter');
+      if (isInternalCall) {
+        throw new Error("Month is required (YYYY-MM)");
+      }
+      // Check if res has status method before calling it
+      if (res && typeof res.status === 'function') {
+        return res.status(400).json({ error: "Month is required (YYYY-MM)" });
+      } else {
+        throw new Error("Month is required (YYYY-MM)");
+      }
+    }
+
+    const [year, monthNum] = month.split("-").map(Number);
+    console.log('[getMonthlyAttendanceSummary] Parsed date:', { year, monthNum });
+    const startDate = new Date(year, monthNum - 1, 1);
+    const endDate = new Date(year, monthNum, 0, 23, 59, 59, 999);
+    const daysInMonth = new Date(year, monthNum, 0).getDate();
+    console.log('[getMonthlyAttendanceSummary] Date range:', { startDate, endDate, daysInMonth });
+
+    // Get all employees
+    console.log('[getMonthlyAttendanceSummary] Fetching employees');
+    const employees = await User.find({ role: { $ne: 'ADMIN' } });
+    console.log('[getMonthlyAttendanceSummary] Found employees:', employees.length);
+
+    // Pre-fetch all approved leaves for employees for this month
+    console.log('[getMonthlyAttendanceSummary] Importing Leave model');
+    let Leave;
+    try {
+      const leaveModule = await import('../../models/leave.model.js');
+      Leave = leaveModule.Leave;
+      console.log('[getMonthlyAttendanceSummary] Leave model imported successfully');
+    } catch (importError) {
+      console.error('[getMonthlyAttendanceSummary] Error importing Leave model:', importError);
+      if (isInternalCall) {
+        throw new Error("Failed to import Leave model");
+      }
+      // Check if res has status method before calling it
+      if (res && typeof res.status === 'function') {
+        return res.status(500).json({ error: "Server error", message: "Failed to import Leave model" });
+      } else {
+        throw new Error("Failed to import Leave model");
+      }
+    }
+
+    const leaveMap = {};
+    console.log('[getMonthlyAttendanceSummary] Processing leaves for employees');
+    for (const emp of employees) {
+      try {
+        const leaves = await Leave.find({
+          empId: emp.empId,
+          year: year,
+          'applications.status': 'Approved',
+          $or: [
+            { 'applications.startDate': { $lte: new Date(year, monthNum - 1, daysInMonth, 23, 59, 59, 999) } },
+            { 'applications.endDate': { $gte: new Date(year, monthNum - 1, 1, 0, 0, 0, 0) } }
+          ]
+        });
+        // Flatten all approved leave date ranges for this month
+        const leaveDays = {};
+        for (const leave of leaves) {
+          for (const app of leave.applications) {
+            if (app.status === 'Approved') {
+              const appStart = new Date(app.startDate);
+              const appEnd = new Date(app.endDate);
+              for (let d = 1; d <= daysInMonth; d++) {
+                const day = new Date(year, monthNum - 1, d);
+                if (day >= appStart && day <= appEnd) {
+                  leaveDays[d] = leave.leaveType;
+                }
+              }
+            }
+          }
+        }
+        leaveMap[emp.empId] = leaveDays;
+      } catch (leaveError) {
+        console.error(`[getMonthlyAttendanceSummary] Error processing leaves for employee ${emp.empId}:`, leaveError);
+      }
+    }
+    console.log('[getMonthlyAttendanceSummary] Leave map created');
+
+    // Get all sessions for attendance calculation
+    // Include sessions that started in this month or previous month but ended in this month (for night shifts)
+    console.log('[getMonthlyAttendanceSummary] Fetching attendance sessions');
+    const allSessions = await AttendanceSession.find({
+      employeeId: { $in: employees.map(emp => emp.empId) },
+      $or: [
+        { inTime: { $gte: startDate, $lte: endDate } }, // Sessions that started in our range
+        {
+          inTime: { $lt: startDate }, // Sessions that started before our range
+          outTime: { $gte: startDate, $lte: endDate } // But ended in our range (night shifts from previous day)
+        }
+      ]
+    }).lean();
+    console.log('[getMonthlyAttendanceSummary] Found sessions:', allSessions.length);
+
+    const results = [];
+    console.log('[getMonthlyAttendanceSummary] Processing employees');
+    for (const emp of employees) {
+      try {
+        const workerType = getWorkerType(emp);
+        const weeklyOffDay = emp.shiftDetails?.weeklyOff || null;
+        const daily = {};
+
+        // Get employee sessions
+        const empSessions = allSessions.filter(s => s.employeeId === emp.empId);
+
+        // Calculate OT hours for this employee (only for fullMonth employees)
+        let totalOtHours = 0;
+        if (emp.employeeType === 'fullMonth') {
+          for (const session of empSessions) {
+            if (session.inTime && session.outTime) {
+              const workHours = (new Date(session.outTime) - new Date(session.inTime)) / (1000 * 60 * 60);
+              const standardHours = emp.shiftDetails?.workHoursPerDay || 9;
+              // Round down OT hours to nearest whole hour
+              if (workHours > standardHours) {
+                totalOtHours += Math.floor(workHours - standardHours);
+              }
+            }
+          }
+        }
+
+        // Process each day of the month
+        for (let d = 1; d <= daysInMonth; d++) {
+          const dateObj = new Date(year, monthNum - 1, d);
+          const dateStr = dateObj.toISOString().slice(0, 10);
+
+          // 1. Check for PH
+          if (phDates.includes(dateStr)) {
+            daily[d] = { code: 'PH' };
+            continue;
+          }
+
+          // 2. Check for Leave
+          const leaveType = leaveMap[emp.empId]?.[d];
+          if (leaveType) {
+            daily[d] = { code: leaveType };
+            continue;
+          }
+
+          // 3. Check for Weekly Off - Only for weeklyOff and weeklyOffWithCoff employee types
+          // Full month employees work on all days including Sundays
+          const isWeeklyOffEmployee = emp.employeeType === 'weeklyOff' || emp.employeeType === 'weeklyOffWithCoff';
+          if (isWeeklyOffEmployee && weeklyOffDay && dateObj.toLocaleString('en-US', { weekday: 'long' }) === weeklyOffDay) {
+            daily[d] = { code: 'WO' };
+            continue;
+          }
+
+          // 4. Check sessions for this day
+          // For night shifts, we only show 'P' on the IN date, not the OUT date
+          // Check for sessions that started on this day
+          const sessionsForDay = empSessions.filter(session => {
+            if (!session.inTime) return false;
+            const sessionDate = new Date(session.inTime);
+            return sessionDate.getDate() === d &&
+              sessionDate.getMonth() === monthNum - 1 &&
+              sessionDate.getFullYear() === year;
+          });
+
+          // Check for night shift sessions that end on this day
+          // These should NOT be marked as present on this day
+          let isNightShiftEndDate = false;
+          for (const session of empSessions) {
+            if (session.inTime && session.outTime) {
+              const inTime = new Date(session.inTime);
+              const outTime = new Date(session.outTime);
+
+              // Check if IN and OUT are on different dates
+              const inDateStr = inTime.toISOString().slice(0, 10);
+              const outDateStr = outTime.toISOString().slice(0, 10);
+
+              // Calculate session duration in hours
+              const sessionDuration = (outTime - inTime) / (1000 * 60 * 60);
+
+              // If this is a night shift with duration < 24 hours and the OUT date matches current date
+              if (inDateStr !== outDateStr && sessionDuration < 24 && outDateStr === dateStr) {
+                isNightShiftEndDate = true;
+                break;
+              }
+            }
+          }
+
+          // If any session started on this day and it's not a night shift end date, show 'P'
+          if (sessionsForDay.length > 0 && !isNightShiftEndDate) {
+            daily[d] = { code: 'P' };
+          } else {
+            daily[d] = { code: 'A' };
+          }
+        }
+
+        results.push({
+          empId: emp.empId,
+          name: `${emp.firstName} ${emp.lastName}`,
+          department: emp.department,
+          designation: emp.designation,
+          fixedSalary: emp.monthlySalary,
+          daily,
+          leaveConfig: emp.leaveConfig || {},
+          shiftDetails: emp.shiftDetails || {},
+          workerType,
+          otHours: Math.round(totalOtHours * 10) / 10 // Round to 1 decimal place
+        });
+      } catch (empError) {
+        console.error(`[getMonthlyAttendanceSummary] Error processing employee ${emp.empId}:`, empError);
+      }
+    }
+    console.log('[getMonthlyAttendanceSummary] Processing complete, returning results:', results.length);
+
+    // Handle internal call differently from HTTP request
+    if (isInternalCall) {
+      return results;
+    } else {
+      // Check if res has json method before calling it
+      if (res && typeof res.json === 'function') {
+        res.json({ data: results });
+      } else {
+        // If res doesn't have json method, we're likely in an internal call context
+        return results;
+      }
+    }
+  } catch (err) {
+    console.error("[getMonthlyAttendanceSummary] Error:", err);
+    console.error("[getMonthlyAttendanceSummary] Error stack:", err.stack);
+    if (isInternalCall) {
+      throw err;
+    } else {
+      // Check if res has the status method before calling it
+      if (res && typeof res.status === 'function') {
+        res.status(500).json({ error: "Server error", message: err.message });
+      } else {
+        // If res doesn't have status method, we're likely in an internal call context
+        throw err;
+      }
+    }
+  }
+};
+
+// Get monthly payroll summary for all employees
+export async function getMonthlyPayrollSummary(req, res) {
+  try {
+    const { month } = req.query;
+    if (!month) {
+      return res.status(400).json({ error: "Month is required (YYYY-MM)" });
+    }
+
+    const [year, monthNum] = month.split('-').map(Number);
+    if (!year || !monthNum) {
+      return res.status(400).json({ error: "Invalid month format. Use YYYY-MM" });
+    }
+
+    // Use the existing calculatePayroll function
+    const payrollData = await calculatePayroll({ month: monthNum, year });
+
+    return res.status(200).json({ data: payrollData });
+  } catch (err) {
+    console.error("Monthly payroll summary error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+};
+
+
+
+// Utility function to detect worker type and classify days
+function getWorkerType(emp) {
+  // 8hr with weekly off
+  if (emp.shiftDetails?.workHoursPerDay === 8 && emp.shiftDetails?.weeklyOff) {
+    return '8hr_weeklyoff';
+  }
+  // 8hr without weekly off, C-OFF eligible
+  if (emp.shiftDetails?.workHoursPerDay === 8 && emp.leaveConfig?.COFF !== undefined) {
+    return '8hr_coff';
+  }
+  // 8hr without weekly off, OT eligible
+  if (emp.shiftDetails?.workHoursPerDay === 8 && emp.leaveConfig?.COFF === undefined) {
+    return '8hr_ot';
+  }
+  // 12hr worker
+  if (emp.shiftDetails?.workHoursPerDay === 12) {
+    return '12hr';
+  }
+  return 'unknown';
+}
+
+// Timeout function (if needed)
+export const withTimeout = (res, timeoutMs = 60000) => {
+
+  // Check if res is a valid Express response object
+  if (!res || typeof res.status !== "function" || typeof res.headersSent === "undefined") {
+    console.warn("withTimeout called with invalid res object. Timeout disabled.");
+    return null;
+  }
+
+  const timer = setTimeout(() => {
+    try {
+      if (!res.headersSent) {
+        res.status(504).json({ error: 'Request timed out' });
+      }
+    } catch (err) {
+      console.error("Timeout handler failed:", err.message);
+    }
+  }, timeoutMs);
+
+  // Auto-clear when finished
+  res.on('finish', () => clearTimeout(timer));
+  res.on('close', () => clearTimeout(timer));
+
+  return timer;
+};

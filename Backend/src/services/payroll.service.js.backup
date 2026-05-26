@@ -1,0 +1,9 @@
+import mongoose from 'mongoose';
+import { User } from '../models/user.model.js';
+import { AttendanceSession } from '../models/attendanceSession.model.js';
+import { Leave } from '../models/leave.model.js';
+import { PayrollSnapshot } from '../models/payrollSnapshot.model.js';
+import { SalaryHistory } from '../models/salaryHistory.model.js';
+import { calculateDetailedSalary } from '../utils/salaryCalculator.js';
+
+// ... rest of the file remains the same ...

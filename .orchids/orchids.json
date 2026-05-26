@@ -1,0 +1,8 @@
+{
+  "projectId": "9f6472af-a075-45dd-a6b3-a227df796565",
+  "createdAt": 1767609225027,
+  "startupCommands": [
+    "cmd /c npm install; cmd /c npm run backend",
+    "cmd /c npm run frontend"
+  ]
+}

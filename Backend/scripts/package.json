@@ -1,0 +1,13 @@
+{
+  "name": "migrate-phone-to-mobile",
+  "version": "1.0.0",
+  "description": "Database migration script to add mobile field to existing employees",
+  "type": "module",
+  "scripts": {
+    "migrate": "node migrate-phone-to-mobile.js"
+  },
+  "dependencies": {
+    "mongoose": "^7.0.0",
+    "dotenv": "^16.0.0"
+  }
+}

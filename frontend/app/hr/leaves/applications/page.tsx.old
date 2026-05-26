@@ -1,0 +1,387 @@
+"use client"
+
+import React, { useEffect, useState } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Textarea } from '@/components/ui/textarea';
+import { Calendar, Clock, User, Plus, Search, Users } from 'lucide-react';
+import { toast } from '@/hooks/use-toast';
+import { SidebarInset, SidebarTrigger } from '@/components/ui/sidebar';
+import { Separator } from '@/components/ui/separator';
+import api from '@/lib/axios';
+
+interface Employee {
+  empId: string;
+  firstName: string;
+  lastName: string;
+  employeeType: string;
+}
+
+interface LeaveApplication {
+  _id: string;
+  empId: string;
+  employeeName: string;
+  leaveType: string;
+  startDate: string;
+  endDate: string;
+  days: number;
+  reason: string;
+  status: string;
+  appliedAt: string;
+}
+
+export default function LeaveApplicationsPage() {
+  const [employees, setEmployees] = useState<Employee[]>([]);
+  const [applications, setApplications] = useState<LeaveApplication[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [selectedEmployee, setSelectedEmployee] = useState('');
+  const [leaveType, setLeaveType] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [reason, setReason] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  // Check for overlapping leave
+  const [overlapWarning, setOverlapWarning] = useState("");
+
+  useEffect(() => {
+    fetchEmployees();
+    fetchApplications();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedEmployee || !startDate || !endDate) {
+      setOverlapWarning("");
+      return;
+    }
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const overlap = applications.some(app =>
+      app.empId === selectedEmployee &&
+      app.status === 'Approved' &&
+      start <= new Date(app.endDate) && end >= new Date(app.startDate)
+    );
+    if (overlap) {
+      setOverlapWarning("Already on leave for one or more selected dates. Cannot add another leave.");
+    } else {
+      setOverlapWarning("");
+    }
+  }, [selectedEmployee, startDate, endDate, applications]);
+
+  const fetchEmployees = async () => {
+    try {
+      console.log('Fetching employees...');
+      const response = await api.get('/employees/getAllEmployees');
+      console.log('Response data:', response.data);
+      
+      if (response.data.success) {
+        setEmployees(response.data.employees || []);
+        if (!response.data.employees || response.data.employees.length === 0) {
+          toast({
+            title: "No Employees Found",
+            description: "There are no employees available to select.",
+            variant: "destructive"
+          });
+        }
+      } else {
+        console.error('Failed to fetch employees:', response.data.message);
+        setEmployees([]);
+        toast({
+          title: "Error",
+          description: response.data.message || "Failed to fetch employees.",
+          variant: "destructive"
+        });
+      }
+    } catch (error: any) {
+      console.error('Error fetching employees:', error);
+      setEmployees([]);
+      toast({
+        title: "Error",
+        description: `Failed to fetch employees: ${error.response?.data?.message || error.message}`,
+        variant: "destructive"
+      });
+    }
+  };
+
+  const fetchApplications = async () => {
+    try {
+      const response = await api.get('/leaves/applications');
+      if (response.data.success) {
+        setApplications(response.data.data);
+      }
+    } catch (error) {
+      console.error('Error fetching applications:', error);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    
+    if (!selectedEmployee || !leaveType || !startDate || !endDate) {
+      toast({
+        title: "Error",
+        description: "Please fill in all required fields",
+        variant: "destructive"
+      });
+      return;
+    }
+
+    try {
+      const response = await api.post(`/leaves/apply/${selectedEmployee}/${new Date().getFullYear()}`, {
+        leaveType,
+        startDate,
+        endDate,
+        reason
+      });
+
+      const data = response.data;
+      
+      if (data.success) {
+        toast({
+          title: "Leave Added",
+          description: "Leave application added successfully.",
+          variant: "default"
+        });
+        // Reset form
+        setSelectedEmployee('');
+        setLeaveType('');
+        setStartDate('');
+        setEndDate('');
+        setReason('');
+        // Refresh applications
+        fetchApplications();
+      } else {
+        if (data.message && data.message.includes("Leave balance not found")) {
+          toast({
+            title: "Leave Balance Not Found",
+            description: data.message || "Please allocate leaves first. Go to Leave Allocation page.",
+            variant: "destructive"
+          });
+        } else {
+          toast({
+            title: "Error",
+            description: data.message || "Failed to add leave application",
+            variant: "destructive"
+          });
+        }
+      }
+    } catch (error: any) {
+      console.error('Error adding leave application:', error);
+      toast({
+        title: "Error",
+        description: `Failed to add leave application: ${error.response?.data?.message || error.message}`,
+        variant: "destructive"
+      });
+    }
+  };
+
+  const getLeaveTypeColor = (type: string) => {
+    switch (type) {
+      case 'PL': return 'bg-blue-100 text-blue-800';
+      case 'CL': return 'bg-green-100 text-green-800';
+      case 'SL': return 'bg-orange-100 text-orange-800';
+      case 'LWP': return 'bg-red-100 text-red-800';
+      case 'COFF': return 'bg-purple-100 text-purple-800';
+      default: return 'bg-gray-100 text-gray-800';
+    }
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case 'Pending': return 'bg-yellow-100 text-yellow-800';
+      case 'Approved': return 'bg-green-100 text-green-800';
+      case 'Rejected': return 'bg-red-100 text-red-800';
+      default: return 'bg-gray-100 text-gray-800';
+    }
+  };
+
+  const formatDate = (dateString: string) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    });
+  };
+
+  const filteredEmployees = employees.filter(emp =>
+    emp.empId.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    `${emp.firstName} ${emp.lastName}`.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  const filteredApplications = applications.filter(app =>
+    app.empId.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    app.employeeName.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    app.leaveType.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  return (
+    <SidebarInset>
+      {/* Modern HR Header */}
+      <header className="flex h-16 items-center gap-2 border-b px-4 bg-white/80 backdrop-blur supports-[backdrop-filter]:bg-white/60">
+        <SidebarTrigger className="-ml-1" />
+        <Separator orientation="vertical" className="mr-2 h-4" />
+        <div>
+          <h1 className="text-lg font-semibold tracking-tight">Leave Applications</h1>
+          <p className="text-sm text-muted-foreground">Add, review, and manage leave applications for employees</p>
+        </div>
+      </header>
+      <div className="flex-1 p-6 space-y-6">
+        {/* Header Section with stats */}
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+          <div>
+            <h2 className="text-3xl font-bold tracking-tight">Leave Application Entry</h2>
+            <p className="text-muted-foreground">Add new leave applications and review existing ones</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant="outline" className="flex items-center gap-1">
+              <Users className="h-3 w-3" />
+              {employees.length} Employees
+            </Badge>
+            <Badge variant="outline" className="flex items-center gap-1">
+              <Calendar className="h-3 w-3" />
+              {applications.length} Applications
+            </Badge>
+          </div>
+        </div>
+        {/* Main Content Grid */}
+        <div className="grid gap-6 lg:grid-cols-2">
+          {/* Add Leave Application Form */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Plus className="h-5 w-5" />
+                Add Leave Application
+              </CardTitle>
+              {overlapWarning && (
+                <div className="text-red-600 text-sm font-semibold mt-2">{overlapWarning}</div>
+              )}
+            </CardHeader>
+            <CardContent>
+              <form onSubmit={handleSubmit} className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium mb-2">Employee *</label>
+                    <div className="space-y-2">
+                      <Input
+                        placeholder="Search employees..."
+                        value={searchTerm}
+                        onChange={(e) => setSearchTerm(e.target.value)}
+                      />
+                      <Select value={selectedEmployee} onValueChange={setSelectedEmployee}>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select employee" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {filteredEmployees.map(emp => (
+                            <SelectItem key={emp.empId} value={emp.empId}>
+                              {emp.empId} - {emp.firstName} {emp.lastName} ({emp.employeeType})
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium mb-2">Leave Type *</label>
+                    <Select value={leaveType} onValueChange={setLeaveType}>
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select leave type" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="PL">PL (Paid Leave)</SelectItem>
+                        <SelectItem value="CL">CL (Casual Leave)</SelectItem>
+                        <SelectItem value="SL">SL (Sick Leave)</SelectItem>
+                        <SelectItem value="LWP">LWP (Leave Without Pay)</SelectItem>
+                        <SelectItem value="COFF">COFF (Compensatory Off)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium mb-2">Start Date *</label>
+                    <Input
+                      type="date"
+                      value={startDate}
+                      onChange={(e) => setStartDate(e.target.value)}
+                      required
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium mb-2">End Date *</label>
+                    <Input
+                      type="date"
+                      value={endDate}
+                      onChange={(e) => setEndDate(e.target.value)}
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-2">Reason</label>
+                  <Textarea
+                    value={reason}
+                    onChange={(e) => setReason(e.target.value)}
+                    placeholder="Enter reason for leave..."
+                    rows={3}
+                  />
+                </div>
+
+                <Button type="submit" className="flex items-center gap-2" disabled={!!overlapWarning}>
+                  <Plus className="h-4 w-4" />
+                  Add Leave Application
+                </Button>
+              </form>
+            </CardContent>
+          </Card>
+          {/* Applications Table */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Clock className="h-5 w-5" />
+                Recent Leave Applications
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {filteredApplications.length === 0 ? (
+                <p className="text-muted-foreground">No leave applications found</p>
+              ) : (
+                <div className="space-y-4">
+                  {filteredApplications.slice(0, 10).map((app) => (
+                    <div key={app._id} className="flex items-center justify-between p-4 border rounded-lg">
+                      <div className="flex items-center space-x-4">
+                        <div>
+                          <p className="font-medium">{app.employeeName}</p>
+                          <p className="text-sm text-muted-foreground">{app.empId}</p>
+                        </div>
+                        <Badge className={getLeaveTypeColor(app.leaveType)}>
+                          {app.leaveType}
+                        </Badge>
+                        <div className="text-sm">
+                          <p>{formatDate(app.startDate)} - {formatDate(app.endDate)}</p>
+                          <p className="text-muted-foreground">{app.days} day(s)</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <Badge className={getStatusColor(app.status)}>
+                          {app.status}
+                        </Badge>
+                        <p className="text-sm text-muted-foreground">
+                          {formatDate(app.appliedAt)}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </SidebarInset>
+  );
+} 
